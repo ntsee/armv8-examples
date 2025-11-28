@@ -1,6 +1,5 @@
 import armsim
 #run instruction tests
-
 '''
 Full program tests in /tests directory
 exit code in x0 for all test cases should be 7
@@ -13,19 +12,16 @@ armsim.reset()
 with open('tests/branch_test.s', 'r') as f:
 	armsim.parse(f.readlines())
 armsim.run()
-assert armsim.reg['x0'] == 7, "arithmetic_test returned incorrect value of {}".format(armsim.reg['x0'])
+assert armsim.reg['x0'] == 7, "branch_test returned incorrect value of {}".format(armsim.reg['x0'])
 armsim.reset()
-
 with open('tests/brk_test.s', 'r') as f:
 	armsim.parse(f.readlines())
 armsim.run()
 assert armsim.reg['x0'] == 7, "brk_test returned incorrect value of {}".format(armsim.reg['x0'])
 armsim.reset()
-
 ''' Test Load/Store '''
 with open('tests/load_store_test.s', 'r') as f:
 	armsim.parse(f.readlines())
-
 armsim.run()
 assert armsim.reg['x1'] == 189
 assert armsim.reg['x2'] == -67
@@ -37,8 +33,28 @@ assert armsim.reg['x7'] == 168
 assert armsim.reg['x9'] == -88
 assert armsim.reg['x10'] == 65448
 armsim.reset()
-
-print("All tests passed")  
-
-test = [5, 10, 15]
-print(test.index(0))
+''' Test Advanced Instructions (MOVK, SMULH, UMULH, LDXR, STXR) '''
+with open('tests/advanced_test.s', 'r') as f:
+	armsim.parse(f.readlines())
+armsim.run()
+assert armsim.reg['x0'] == 7, "advanced_test returned incorrect value of {}".format(armsim.reg['x0'])
+armsim.reset()
+''' Test FP Arithmetic (FADDS/D, FSUBS/D, FMULS/D, FDIVS/D) '''
+with open('tests/fp_arithmetic_test.s', 'r') as f:
+	armsim.parse(f.readlines())
+armsim.run()
+assert armsim.reg['x0'] == 7, "fp_arithmetic_test returned incorrect value of {}".format(armsim.reg['x0'])
+armsim.reset()
+''' Test FP Branches (FCMPS/D with conditional branches) '''
+with open('tests/fp_branch_test.s', 'r') as f:
+	armsim.parse(f.readlines())
+armsim.run()
+assert armsim.reg['x0'] == 7, "fp_branch_test returned incorrect value of {}".format(armsim.reg['x0'])
+armsim.reset()
+''' Test FP Load/Store (LDURS/D, STURS/D) '''
+with open('tests/fp_load_store_test.s', 'r') as f:
+	armsim.parse(f.readlines())
+armsim.run()
+assert armsim.reg['x0'] == 7, "fp_load_store_test returned incorrect value of {}".format(armsim.reg['x0'])
+armsim.reset()
+print("All tests passed")

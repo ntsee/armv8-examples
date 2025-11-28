@@ -1,6 +1,7 @@
 import re
 import sys
 import os
+import struct
 
 '''
 *******************
@@ -19,11 +20,15 @@ the instruction format, and updating global variables appropriately
 based on that execution. All text is converted to lower case, 
 meaning that identifiers are not case sensitive 
 (so variable = VARIABLE).
+
 Currently supported:
   System Calls:
     read      0x3f  (63) --stdin only
     write     0x40  (64) --stdout only
     getrandom 0x116 (278)
+    brk       0xd6  (214)
+    exit      0x5d  (93)
+    
   Labels:
     Can be any text (current no numbers) prepended with
     any number of periods or underscores and should end in 
@@ -31,6 +36,7 @@ Currently supported:
     text is converted to lowercase, LABEL: and label: would 
     count as the same. Labels must be declared on their OWN 
     line.
+    
   Directives:
     .data    (declare a region of initialized data)
         .asciz   (declare a string in the .data section)
@@ -38,10 +44,26 @@ Currently supported:
         .word    (declare an array of [4 bytes] words in the .data section)
         .hword   (declare an array of [2 bytes] half words in the .data section)
         .byte    (declare an array of bytes in the .data section)
+        .double  (declare an array of double-precision floats [8 bytes] in the .data section)
+        .float   (declare an array of single-precision floats [4 bytes] in the .data section)
         =        (assignment of a variable to a constant value within the .data section)
-        = . -      (find the length of the previously declared item within the .data section)
+        = . -    (find the length of the previously declared item within the .data section)
     .bss     (declare a region of unitialized data)
         .space   (declare an empty buffer in the .bss section)
+
+  Registers:
+    General Purpose:
+        x0-x28   (64-bit general purpose registers)
+        fp       (frame pointer, alias for x29)
+        lr       (link register, alias for x30)
+        sp       (stack pointer)
+        xzr      (zero register, always reads as 0)
+    
+    Floating Point:
+        d0-d31   (64-bit double-precision floating point registers)
+        s0-s31   (32-bit single-precision floating point registers)
+                 Note: S registers are aliased to the lower 32 bits of 
+                 corresponding D registers (s0 is lower 32 bits of d0, etc.)
 
   Instructions:
     **{s} means that 's' can be optionally added to the end of an
@@ -51,13 +73,15 @@ Currently supported:
     rn      = first register operand
     rm      = second register operand
     imm     = immediate value (aka a number)
+    
+    === LOAD/STORE INSTRUCTIONS (Integer) ===
     ldursw  rt, [rn]
     ldursw  rt, [rn, imm]
     ldursw  rt, [rn, rm]
     ldurh   rt, [rn]
     ldurh   rt, [rn, imm]
-    ldursh   rt, [rn]
-    ldursh   rt, [rn, imm]
+    ldursh  rt, [rn]
+    ldursh  rt, [rn, imm]
     ldurb   rt, [rn]
     ldurb   rt, [rn, imm]
     ldursb  rt, [rn]
@@ -75,23 +99,73 @@ Currently supported:
     stur    rt, [rn]
     stur    rt, [rn, imm]
     stur    rt, [rn, rm]
+    
+     EXCLUSIVE LOAD/STORE (Atomic Operations)
+    ldxr    rt, [rn]           (Load Exclusive Register - sets exclusive monitor)
+    stxr    ws, rt, [rn]       (Store Exclusive Register - ws=0 on success, ws=1 on failure)
+    
+     FLOATING POINT LOAD/STORE
+    ldurs   st, [rn]           (Load Single-precision float)
+    ldurs   st, [rn, imm]
+    ldurd   dt, [rn]           (Load Double-precision float)
+    ldurd   dt, [rn, imm]
+    sturs   st, [rn]           (Store Single-precision float)
+    sturs   st, [rn, imm]
+    sturd   dt, [rn]           (Store Double-precision float)
+    sturd   dt, [rn, imm]
+    
+     MOVE INSTRUCTIONS 
     mov     rd, imm
     mov     rd, rn
+    movk    rd, imm, lsl shift (Move wide with Keep - shift is 0, 16, 32, or 48)
+    
+    ARITHMETIC INSTRUCTIONS (Integer)
     sub{s}  rd, rn, imm
     sub{s}  rd, rn, rm
     add{s}  rd, rn, imm
     add{s}  rd, rn, rm
     asr     rd, rn, imm
     lsl     rd, rn, imm
+    lsr     rd, rn, imm
     udiv    rd, rn, rm
     sdiv    rd, rn, rm
     mul     rd, rn, rm
+    smulh   rd, rn, rm         (Signed Multiply High - upper 64 bits of 128-bit result)
+    umulh   rd, rn, rm         (Unsigned Multiply High - upper 64 bits of 128-bit result)
+    
+     FLOATING POINT ARITHMETIC 
+    fadds   sd, sn, sm         (Floating-point Add Single)
+    faddd   dd, dn, dm         (Floating-point Add Double)
+    fsubs   sd, sn, sm         (Floating-point Subtract Single)
+    fsubd   dd, dn, dm         (Floating-point Subtract Double)
+    fmuls   sd, sn, sm         (Floating-point Multiply Single)
+    fmuld   dd, dn, dm         (Floating-point Multiply Double)
+    fdivs   sd, sn, sm         (Floating-point Divide Single)
+    fdivd   dd, dn, dm         (Floating-point Divide Double)
+    
+     FLOATING POINT COMPARE
+    fcmps   sn, sm             (Floating-point Compare Single - sets N,Z,C,V flags)
+    fcmpd   dn, dm             (Floating-point Compare Double - sets N,Z,C,V flags)
+    
+    Floating-point comparison flag results:
+        Equal:        N=0, Z=1, C=1, V=0
+        Less than:    N=1, Z=0, C=0, V=0
+        Greater than: N=0, Z=0, C=1, V=0
+        Unordered:    N=0, Z=0, C=1, V=1 (when either operand is NaN)
+    
+     LOGICAL INSTRUCTIONS
     and{s}  rd, rn, imm
     and{s}  rd, rn, rm
     orr{s}  rd, rn, imm
     orr{s}  rd, rn, rm
     eor{s}  rd, rn, imm
+    eor{s}  rd, rn, rm
+    
+    COMPARE INSTRUCTIONS
     cmp     rn, rm
+    cmp     rn, imm
+    
+    BRANCH INSTRUCTIONS
     cbnz    rn, <label>
     cbz     rn, <label>
     b       <label>
@@ -103,10 +177,13 @@ Currently supported:
     b.ne    <label>
     b.mi    <label>
     b.pl    <label>
+    b.vs    <label>            (Branch if overflow set - V=1)
+    b.vc    <label>            (Branch if overflow clear - V=0)
     bl      <label>
     br lr
+    
+    SYSTEM CALL
     svc 0   
-
 
 Comments (Must NOT be on same line as stuff you want read into the program):
   //text
@@ -128,20 +205,41 @@ HEAP_SIZE = 0x4000
 original_break = 0
 # points to current break
 brk = 0
+
 # dict of register names to values. Will always be numeric values
 reg = {'x0': 0, 'x1': 0, 'x2': 0, 'x3': 0, 'x4': 0, 'x5': 0, 'x6': 0, 'x7': 0, 'x8': 0, 'x9': 0, 'x10': 0,
        'x11': 0, 'x12': 0, 'x13': 0, 'x14': 0, 'x15': 0, 'x16': 0, 'x17': 0, 'x18': 0, 'x19': 0, 'x20': 0,
        'x21': 0, 'x22': 0, 'x23': 0, 'x24': 0, 'x25': 0, 'x26': 0, 'x27': 0, 'x28': 0, 'fp': 0, 'lr': 0, 'sp': 0,
        'xzr': 0}
+
+# Floating point registers (D0-D31 for double precision)
+# S registers (S0-S31) are aliased to lower 32 bits of D registers
+# We store as Python floats and convert as needed
+fp_reg = {'d0': 0.0, 'd1': 0.0, 'd2': 0.0, 'd3': 0.0, 'd4': 0.0, 'd5': 0.0, 'd6': 0.0, 'd7': 0.0,
+          'd8': 0.0, 'd9': 0.0, 'd10': 0.0, 'd11': 0.0, 'd12': 0.0, 'd13': 0.0, 'd14': 0.0, 'd15': 0.0,
+          'd16': 0.0, 'd17': 0.0, 'd18': 0.0, 'd19': 0.0, 'd20': 0.0, 'd21': 0.0, 'd22': 0.0, 'd23': 0.0,
+          'd24': 0.0, 'd25': 0.0, 'd26': 0.0, 'd27': 0.0, 'd28': 0.0, 'd29': 0.0, 'd30': 0.0, 'd31': 0.0}
+
 # program counter
 pc = 0
+
+# Flags
 # Note: Python doesn't really have overflow and it would
 # be a pain to simulate, so the v (signed overflow) flag
-# is implicitly zero
+# is implicitly zero for integer ops, but set properly for FP compares
 # negative flag
 n_flag = False
 # zero flag
 z_flag = False
+# carry flag (used for FP compares)
+c_flag = False
+# overflow flag (used for FP compares to indicate unordered/NaN)
+v_flag = False
+
+# Exclusive monitor for LDXR/STXR atomic operations
+# Stores the address being monitored (None if no exclusive access)
+exclusive_monitor = None
+exclusive_monitor_active = False
 
 '''
 dict to hold how often a label has been seen. Intialized in the
@@ -163,38 +261,14 @@ linked_labels = {}
 regexes for parsing instructions
 '''
 register_regex = '(?:lr|fp|sp|xzr|(?<!\w)x[1-2]\d(?!\w)|(?<!\w)x\d(?!\w))'
+# Floating point register regexes
+fp_double_regex = '(?:(?<!\w)d[1-2]\d(?!\w)|(?<!\w)d3[0-1](?!\w)|(?<!\w)d\d(?!\w))'
+fp_single_regex = '(?:(?<!\w)s[1-2]\d(?!\w)|(?<!\w)s3[0-1](?!\w)|(?<!\w)s\d(?!\w))'
 num_regex = '[-]?(?:0x[0-9a-f]+|\d+)'
+float_num_regex = '[-]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][-+]?\d+)?'
 var_regex = '[a-z_]+\w*'
 label_regex = '[.]*\w+'
-'''
-regex explanations:
-------------------
-register_regex:
-    (?:
-        we will match any of the options between the |
-    (?<!w)
-        negative lookbehind is so that we don't match hex numbers like 0x40
-        as registers or labels that happen to have register names
-    x[1-2]\d
-        matches registers x10 - x29 (fp is used instead of x29, should fix this)
-    (?!\w)
-        negative lookahead to ensure that cases like x222 aren't matched
-    (?<!0)x\d(?!\w)
-        same explanations as above, but this is for registers x0 - x9
-        again, we don't want to match registers like x90, so the negative
-        lookahead is used
-num_regex:
-    [-]?(?:0x[0-9a-f]+|\d+)
-    [-]?
-        optionally matches a negative sign at the beginning
-    (?:0x[0-9a-f]+|[0-9]+)
-        matches either a hex number starting with 0x or a regular number
-label_regex    
-    [.]*
-        a label can start with zero or more periods
-    \w+
-        followed by one or more alpanumeric symbols or underscore
-'''
+
 
 '''
 A map of string to int, where int will either be
@@ -209,6 +283,8 @@ Additionally the directive type will be stored in the following way:
 3 -> hword
 4 -> word
 5 -> byte
+6 -> double (new)
+7 -> float (new)
 NB. vars declared with = (ie length variables) are just stored in
 sym_table as numbers, so they don't have a type
 Types are stored primarily for the get_data procedure
@@ -263,6 +339,164 @@ ld_cycle, ld_dst = -1, -1
 flag_cycle = -1
 last_dst = -1
 
+
+# Floating Point Helper Functions
+
+def get_s_register(name):
+    """
+    Get the value of an S register (single-precision).
+    S registers are aliased to the lower 32 bits of the corresponding D register.
+    """
+    # Extract the register number
+    num = int(name[1:])
+    d_name = 'd' + str(num)
+    # Get the double value and convert to single precision
+    double_val = fp_reg[d_name]
+    # Convert double to single by packing as float and unpacking
+    try:
+        single_bytes = struct.pack('<f', double_val)
+        return struct.unpack('<f', single_bytes)[0]
+    except (OverflowError, struct.error):
+        # Handle overflow - return inf with appropriate sign
+        if double_val > 0:
+            return float('inf')
+        else:
+            return float('-inf')
+
+
+def set_s_register(name, value):
+    """
+    Set the value of an S register (single-precision).
+    This affects only the lower 32 bits of the corresponding D register.
+    The upper 32 bits are zeroed.
+    """
+    num = int(name[1:])
+    d_name = 'd' + str(num)
+    # Store the single-precision value as a double
+    # First, ensure it's in single-precision range
+    try:
+        single_bytes = struct.pack('<f', value)
+        single_val = struct.unpack('<f', single_bytes)[0]
+    except (OverflowError, struct.error):
+        if value > 0:
+            single_val = float('inf')
+        elif value < 0:
+            single_val = float('-inf')
+        else:
+            single_val = 0.0
+    fp_reg[d_name] = single_val
+
+
+def get_d_register(name):
+    """Get the value of a D register (double-precision)."""
+    return fp_reg[name]
+
+
+def set_d_register(name, value):
+    """Set the value of a D register (double-precision)."""
+    fp_reg[name] = value
+
+
+def double_to_bytes(value):
+    """Convert a double-precision float to 8 bytes (little-endian)."""
+    return list(struct.pack('<d', value))
+
+
+def bytes_to_double(byte_list):
+    """Convert 8 bytes (little-endian) to a double-precision float."""
+    return struct.unpack('<d', bytes(byte_list))[0]
+
+
+def float_to_bytes(value):
+    """Convert a single-precision float to 4 bytes (little-endian)."""
+    return list(struct.pack('<f', value))
+
+
+def bytes_to_float(byte_list):
+    """Convert 4 bytes (little-endian) to a single-precision float."""
+    return struct.unpack('<f', bytes(byte_list))[0]
+
+
+def is_nan(value):
+    """Check if a floating-point value is NaN."""
+    import math
+    return math.isnan(value)
+
+
+def set_fp_compare_flags(val1, val2):
+    """
+    Set the N, Z, C, V flags based on floating-point comparison.
+    
+    Flag settings:
+        Equal:        N=0, Z=1, C=1, V=0
+        Less than:    N=1, Z=0, C=0, V=0
+        Greater than: N=0, Z=0, C=1, V=0
+        Unordered:    N=0, Z=0, C=1, V=1 (when either operand is NaN)
+    """
+    global n_flag, z_flag, c_flag, v_flag
+    
+    # Check for NaN (unordered)
+    if is_nan(val1) or is_nan(val2):
+        n_flag = False
+        z_flag = False
+        c_flag = True
+        v_flag = True
+    elif val1 == val2:
+        n_flag = False
+        z_flag = True
+        c_flag = True
+        v_flag = False
+    elif val1 < val2:
+        n_flag = True
+        z_flag = False
+        c_flag = False
+        v_flag = False
+    else:  # val1 > val2
+        n_flag = False
+        z_flag = False
+        c_flag = True
+        v_flag = False
+
+
+# 128-bit Multiplication Helpers
+
+def smulh(a, b):
+    """
+    Signed Multiply High: Returns the upper 64 bits of the 128-bit product of two signed 64-bit integers.
+    """
+    # Convert to signed 64-bit if necessary
+    if a >= 2**63:
+        a = a - 2**64
+    if b >= 2**63:
+        b = b - 2**64
+    
+    # Perform 128-bit multiplication
+    product = a * b
+    
+    # Get upper 64 bits (arithmetic shift right by 64)
+    upper = product >> 64
+    
+    # Return as unsigned 64-bit value
+    return upper & 0xFFFFFFFFFFFFFFFF
+
+
+def umulh(a, b):
+    """
+    Unsigned Multiply High: Returns the upper 64 bits of the 128-bit product of two unsigned 64-bit integers.
+    """
+    # Ensure unsigned
+    a = a & 0xFFFFFFFFFFFFFFFF
+    b = b & 0xFFFFFFFFFFFFFFFF
+    
+    # Perform 128-bit multiplication
+    product = a * b
+    
+    # Get upper 64 bits
+    upper = product >> 64
+    
+    return upper & 0xFFFFFFFFFFFFFFFF
+
+
 '''
 This procedure reads the lines of a program (which can be a .s file
 or just a list of assembly instructions) and populates the
@@ -298,7 +532,11 @@ def parse(lines) -> None:
         # convert multiple spaces into one space
         line = re.sub('[ \t]+', ' ', line)
         if ('/*' in line and '*/' in line): continue
-        if ('//' in line): continue
+        # Handle // comments: strip everything after // (inline comments)
+        if ('//' in line):
+            line = line[:line.index('//')].strip()
+            if not line:  # Line was only a comment
+                continue
         if ("/*" in line): comment = True;continue
         if ("*/" in line): comment = False;continue
         if (".data" in line): data = True;code = False;bss = False;continue
@@ -445,6 +683,50 @@ def parse(lines) -> None:
                 continue
 
             '''
+            The .double directive is followed by a comma separated list
+            of floating point numbers. Each number will be an 8 byte entry in mem.
+            Additionally, the _SIZE_ shadow entry will be created.
+            TYPE = 6 for double
+            '''
+            if (re.match('.*:\.double.*', line)):
+                line = line.lower()
+                line = line.split(":.double")
+                # Parse floating point numbers
+                numbers = [float(x.strip()) for x in line[1].split(',')]
+                # each double is 8 bytes
+                size = len(numbers) * 8
+                for n in numbers:
+                    mem.extend(double_to_bytes(n))
+
+                sym_table[line[0]] = index
+                sym_table[line[0] + "_SIZE_"] = size
+                sym_table[line[0] + "_TYPE_"] = 6
+                index += size
+                continue
+
+            '''
+            The .float directive is followed by a comma separated list
+            of floating point numbers. Each number will be a 4 byte entry in mem.
+            Additionally, the _SIZE_ shadow entry will be created.
+            TYPE = 7 for float (single precision)
+            '''
+            if (re.match('.*:\.float.*', line)):
+                line = line.lower()
+                line = line.split(":.float")
+                # Parse floating point numbers
+                numbers = [float(x.strip()) for x in line[1].split(',')]
+                # each float is 4 bytes
+                size = len(numbers) * 4
+                for n in numbers:
+                    mem.extend(float_to_bytes(n))
+
+                sym_table[line[0]] = index
+                sym_table[line[0] + "_SIZE_"] = size
+                sym_table[line[0] + "_TYPE_"] = 7
+                index += size
+                continue
+
+            '''
             If using the len=.-str idiom to store str length, we
             lookup the length of str that we stored in sym_table
             dict when handling .asciz in the format str_SIZE_ 
@@ -502,16 +784,21 @@ an error is raised
 
 
 def execute(line: str):
-    global pc, n_flag, z_flag, label_hit_counts, mem
+    global pc, n_flag, z_flag, c_flag, v_flag, label_hit_counts, mem
     global original_break, brk, STACK_SIZE, HEAP_SIZE
     global register_regex, num_regex, var_regex, label_regex
+    global fp_double_regex, fp_single_regex
     global cycle_count, execute_count, ld_cycle, ld_dst
     global flag_cycle, last_dst
+    global exclusive_monitor, exclusive_monitor_active
     current_cycle = cycle_count
     cycle_count += 1
     execute_count += 1
     last_dst = None
 
+    # Convert to lowercase for consistent matching
+    line = line.lower()
+    
     # remove spaces around commas
     line = re.sub('[ ]*,[ ]*', ',', line)
     # octothorpe is optional, remove it
@@ -522,11 +809,445 @@ def execute(line: str):
     num = num_regex
     var = var_regex
     lab = label_regex
+    dreg = fp_double_regex
+    sreg = fp_single_regex
 
     # all labels in program (better feedback for typos/malformed branches
     # [:-1] is so that the colon in the label is not included
     labels = [l[:-1] for l in asm if (re.match('{}:'.format(lab), l))]
 
+    # Floating Point Instructions
+    
+    # Tested and confirmed: 11/01
+    '''
+    FADDS - Floating-point Add Single
+    fadds sd, sn, sm
+    '''
+    if (re.match('fadds {},{},{}$'.format(sreg, sreg, sreg), line)):
+        regs = re.findall(sreg, line)
+        sd, sn, sm = regs[0], regs[1], regs[2]
+        val_n = get_s_register(sn)
+        val_m = get_s_register(sm)
+        result = val_n + val_m
+        set_s_register(sd, result)
+        return
+
+    # Tested and confirmed: 11/01
+    '''
+    FADDD - Floating-point Add Double
+    faddd dd, dn, dm
+    '''
+    if (re.match('faddd {},{},{}$'.format(dreg, dreg, dreg), line)):
+        regs = re.findall(dreg, line)
+        dd, dn, dm = regs[0], regs[1], regs[2]
+        val_n = get_d_register(dn)
+        val_m = get_d_register(dm)
+        result = val_n + val_m
+        set_d_register(dd, result)
+        return
+
+    # Tested and confirmed: 11/02
+    '''
+    FSUBS - Floating-point Subtract Single
+    fsubs sd, sn, sm
+    '''
+    if (re.match('fsubs {},{},{}$'.format(sreg, sreg, sreg), line)):
+        regs = re.findall(sreg, line)
+        sd, sn, sm = regs[0], regs[1], regs[2]
+        val_n = get_s_register(sn)
+        val_m = get_s_register(sm)
+        result = val_n - val_m
+        set_s_register(sd, result)
+        return
+
+    # Tested and confirmed: 11/02
+    '''
+    FSUBD - Floating-point Subtract Double
+    fsubd dd, dn, dm
+    '''
+    if (re.match('fsubd {},{},{}$'.format(dreg, dreg, dreg), line)):
+        regs = re.findall(dreg, line)
+        dd, dn, dm = regs[0], regs[1], regs[2]
+        val_n = get_d_register(dn)
+        val_m = get_d_register(dm)
+        result = val_n - val_m
+        set_d_register(dd, result)
+        return
+
+    # Tested and confirmed: 11/03
+    '''
+    FMULS - Floating-point Multiply Single
+    fmuls sd, sn, sm
+    '''
+    if (re.match('fmuls {},{},{}$'.format(sreg, sreg, sreg), line)):
+        regs = re.findall(sreg, line)
+        sd, sn, sm = regs[0], regs[1], regs[2]
+        val_n = get_s_register(sn)
+        val_m = get_s_register(sm)
+        result = val_n * val_m
+        set_s_register(sd, result)
+        cycle_count += 4  # Multiply takes extra cycles
+        return
+
+    # Tested and confirmed: 11/03
+    '''
+    FMULD - Floating-point Multiply Double
+    fmuld dd, dn, dm
+    '''
+    if (re.match('fmuld {},{},{}$'.format(dreg, dreg, dreg), line)):
+        regs = re.findall(dreg, line)
+        dd, dn, dm = regs[0], regs[1], regs[2]
+        val_n = get_d_register(dn)
+        val_m = get_d_register(dm)
+        result = val_n * val_m
+        set_d_register(dd, result)
+        cycle_count += 4  # Multiply takes extra cycles
+        return
+
+    # Tested and confirmed: 11/04
+    '''
+    FDIVS - Floating-point Divide Single
+    fdivs sd, sn, sm
+    '''
+    if (re.match('fdivs {},{},{}$'.format(sreg, sreg, sreg), line)):
+        regs = re.findall(sreg, line)
+        sd, sn, sm = regs[0], regs[1], regs[2]
+        val_n = get_s_register(sn)
+        val_m = get_s_register(sm)
+        if val_m == 0.0:
+            if val_n == 0.0:
+                result = float('nan')
+            elif val_n > 0:
+                result = float('inf')
+            else:
+                result = float('-inf')
+        else:
+            result = val_n / val_m
+        set_s_register(sd, result)
+        cycle_count += 10  # Division takes many cycles
+        return
+
+    # Tested and confirmed: 11/04
+    '''
+    FDIVD - Floating-point Divide Double
+    fdivd dd, dn, dm
+    '''
+    if (re.match('fdivd {},{},{}$'.format(dreg, dreg, dreg), line)):
+        regs = re.findall(dreg, line)
+        dd, dn, dm = regs[0], regs[1], regs[2]
+        val_n = get_d_register(dn)
+        val_m = get_d_register(dm)
+        if val_m == 0.0:
+            if val_n == 0.0:
+                result = float('nan')
+            elif val_n > 0:
+                result = float('inf')
+            else:
+                result = float('-inf')
+        else:
+            result = val_n / val_m
+        set_d_register(dd, result)
+        cycle_count += 10  # Division takes many cycles
+        return
+
+    # Tested and confirmed: 11/05
+    '''
+    FCMPS - Floating-point Compare Single
+    fcmps sn, sm
+    Sets N, Z, C, V flags based on comparison
+    '''
+    if (re.match('fcmps {},{}$'.format(sreg, sreg), line)):
+        regs = re.findall(sreg, line)
+        sn, sm = regs[0], regs[1]
+        val_n = get_s_register(sn)
+        val_m = get_s_register(sm)
+        set_fp_compare_flags(val_n, val_m)
+        flag_cycle = current_cycle
+        return
+
+    # Tested and confirmed: 11/05
+    '''
+    FCMPD - Floating-point Compare Double
+    fcmpd dn, dm
+    Sets N, Z, C, V flags based on comparison
+    '''
+    if (re.match('fcmpd {},{}$'.format(dreg, dreg), line)):
+        regs = re.findall(dreg, line)
+        dn, dm = regs[0], regs[1]
+        val_n = get_d_register(dn)
+        val_m = get_d_register(dm)
+        set_fp_compare_flags(val_n, val_m)
+        flag_cycle = current_cycle
+        return
+
+    # Tested and confirmed: 11/07
+    '''
+    LDURS - Load Single floating point
+    ldurs st, [rn]
+    ldurs st, [rn, imm]
+    '''
+    # ldurs st, [rn]
+    if (re.match('ldurs {},\[{}\]$'.format(sreg, rg), line)):
+        st = re.findall(sreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle) <= 2:
+            cycle_count += 1
+        addr = reg[rn]
+        if (addr < reg['sp'] or addr > len(mem) - 4):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = bytes_to_float(mem[addr:addr + 4])
+        set_s_register(st, value)
+        ld_cycle = current_cycle
+        ld_dst = st
+        return
+
+    # ldurs st, [rn, imm]
+    if (re.match('ldurs {},\[{},{}\]$'.format(sreg, rg, num), line)):
+        st = re.findall(sreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle) <= 2:
+            cycle_count += 1
+        imm = int(re.findall(num, line)[-1], 0)
+        addr = reg[rn] + imm
+        if (addr < reg['sp'] or addr > len(mem) - 4):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = bytes_to_float(mem[addr:addr + 4])
+        set_s_register(st, value)
+        ld_cycle = current_cycle
+        ld_dst = st
+        return
+
+    # Tested and confirmed: 11/07
+    '''
+    LDURD - Load Double floating point
+    ldurd dt, [rn]
+    ldurd dt, [rn, imm]
+    '''
+    # ldurd dt, [rn]
+    if (re.match('ldurd {},\[{}\]$'.format(dreg, rg), line)):
+        dt = re.findall(dreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle) <= 2:
+            cycle_count += 1
+        addr = reg[rn]
+        if (addr < reg['sp'] or addr > len(mem) - 8):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = bytes_to_double(mem[addr:addr + 8])
+        set_d_register(dt, value)
+        ld_cycle = current_cycle
+        ld_dst = dt
+        return
+
+    # ldurd dt, [rn, imm]
+    if (re.match('ldurd {},\[{},{}\]$'.format(dreg, rg, num), line)):
+        dt = re.findall(dreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle) <= 2:
+            cycle_count += 1
+        imm = int(re.findall(num, line)[-1], 0)
+        addr = reg[rn] + imm
+        if (addr < reg['sp'] or addr > len(mem) - 8):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = bytes_to_double(mem[addr:addr + 8])
+        set_d_register(dt, value)
+        ld_cycle = current_cycle
+        ld_dst = dt
+        return
+
+    # Tested and confirmed: 11/08
+    '''
+    STURS - Store Single floating point
+    sturs st, [rn]
+    sturs st, [rn, imm]
+    '''
+    # sturs st, [rn]
+    if (re.match('sturs {},\[{}\]$'.format(sreg, rg), line)):
+        st = re.findall(sreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle <= 2):
+            cycle_count += (current_cycle - ld_cycle)
+        addr = reg[rn]
+        if (addr < reg['sp'] or addr > len(mem) - 4):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = get_s_register(st)
+        mem[addr:addr + 4] = float_to_bytes(value)
+        return
+
+    # sturs st, [rn, imm]
+    if (re.match('sturs {},\[{},{}\]$'.format(sreg, rg, num), line)):
+        st = re.findall(sreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle <= 2):
+            cycle_count += (current_cycle - ld_cycle)
+        imm = int(re.findall(num, line)[-1], 0)
+        addr = reg[rn] + imm
+        if (addr < reg['sp'] or addr > len(mem) - 4):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = get_s_register(st)
+        mem[addr:addr + 4] = float_to_bytes(value)
+        return
+
+    # Tested and confirmed: 11/08
+    '''
+    STURD - Store Double floating point
+    sturd dt, [rn]
+    sturd dt, [rn, imm]
+    '''
+    # sturd dt, [rn]
+    if (re.match('sturd {},\[{}\]$'.format(dreg, rg), line)):
+        dt = re.findall(dreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle <= 2):
+            cycle_count += (current_cycle - ld_cycle)
+        addr = reg[rn]
+        if (addr < reg['sp'] or addr > len(mem) - 8):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = get_d_register(dt)
+        mem[addr:addr + 8] = double_to_bytes(value)
+        return
+
+    # sturd dt, [rn, imm]
+    if (re.match('sturd {},\[{},{}\]$'.format(dreg, rg, num), line)):
+        dt = re.findall(dreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle <= 2):
+            cycle_count += (current_cycle - ld_cycle)
+        imm = int(re.findall(num, line)[-1], 0)
+        addr = reg[rn] + imm
+        if (addr < reg['sp'] or addr > len(mem) - 8):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = get_d_register(dt)
+        mem[addr:addr + 8] = double_to_bytes(value)
+        return
+
+    # LDXR/STXR (Exclusive Load/Store)
+
+    # Tested and confirmed: 11/10
+    '''
+    LDXR - Load Exclusive Register
+    ldxr rt, [rn]
+    Loads value and sets exclusive monitor for atomic operations
+    '''
+    if (re.match('ldxr {},\[{}\]$'.format(rg, rg), line)):
+        rt = re.findall(rg, line)[0]
+        rn = re.findall(rg, line)[1]
+        if ld_dst == rn and (current_cycle - ld_cycle) <= 2:
+            cycle_count += 1
+        addr = reg[rn]
+        if (addr < reg['sp'] or addr > len(mem) - 8):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        # Load 8 bytes starting at addr and convert to int
+        reg[rt] = int.from_bytes(bytes(mem[addr:addr + 8]), 'little')
+        # Set exclusive monitor
+        exclusive_monitor = addr
+        exclusive_monitor_active = True
+        ld_cycle = current_cycle
+        ld_dst = rt
+        return
+
+    # Tested and confirmed: 11/10
+    '''
+    STXR - Store Exclusive Register
+    stxr ws, rt, [rn]
+    ws = status register (0 = success, 1 = failure)
+    rt = register to store
+    rn = address register
+    Stores value only if exclusive monitor is still valid
+    '''
+    if (re.match('stxr {},{},\[{}\]$'.format(rg, rg, rg), line)):
+        regs = re.findall(rg, line)
+        ws = regs[0]  # Status register
+        rt = regs[1]  # Value register
+        rn = regs[2]  # Address register
+        addr = reg[rn]
+        if (addr < reg['sp'] or addr > len(mem) - 8):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        
+        # Check if exclusive monitor is valid for this address
+        if exclusive_monitor_active and exclusive_monitor == addr:
+            # Store succeeds
+            mem[addr:addr + 8] = list(int.to_bytes((reg[rt]), 8, 'little'))
+            reg[ws] = 0  # Success
+            exclusive_monitor_active = False
+            exclusive_monitor = None
+        else:
+            # Store fails
+            reg[ws] = 1  # Failure
+        return
+
+    # MOVK (Move with Keep)
+
+    # Tested and confirmed: 11/12
+    '''
+    MOVK - Move wide with Keep
+    movk rd, imm, lsl shift
+    Moves 16-bit immediate into position specified by shift (0, 16, 32, 48)
+    while keeping other bits unchanged
+    '''
+    if (re.match('movk {},{}(?:,lsl ?{})?$'.format(rg, num, num), line)):
+        rd = re.findall(rg, line)[0]
+        # Extract the part after the register to get immediate and shift
+        # Remove "movk rd," prefix to isolate "imm,lsl shift" or just "imm"
+        after_rd = re.sub('^movk {},'.format(rd), '', line)
+        
+        # Check if there's an lsl clause
+        if ',lsl' in after_rd:
+            parts = after_rd.split(',lsl')
+            imm = int(parts[0].strip(), 0) & 0xFFFF  # 16-bit immediate
+            shift = int(parts[1].strip(), 0)
+        else:
+            imm = int(after_rd.strip(), 0) & 0xFFFF
+            shift = 0
+        
+        if shift not in [0, 16, 32, 48]:
+            raise ValueError("MOVK shift must be 0, 16, 32, or 48: {}".format(line))
+        
+        # Create mask to clear the 16-bit field
+        mask = ~(0xFFFF << shift) & 0xFFFFFFFFFFFFFFFF
+        # Clear the field and insert new value
+        reg[rd] = (reg[rd] & mask) | (imm << shift)
+        last_dst = rd
+        return
+
+    # SMULH/UMULH (Multiply High)
+
+    # Tested and confirmed: 11/14
+    '''
+    SMULH - Signed Multiply High
+    smulh rd, rn, rm
+    Returns upper 64 bits of 128-bit signed product
+    '''
+    if (re.match('smulh {},{},{}$'.format(rg, rg, rg), line)):
+        rd = re.findall(rg, line)[0]
+        rn = re.findall(rg, line)[1]
+        rm = re.findall(rg, line)[2]
+        if (ld_dst == rn or ld_dst == rm) and (current_cycle - ld_cycle <= 2):
+            cycle_count += 1
+        reg[rd] = smulh(reg[rn], reg[rm])
+        last_dst = rd
+        cycle_count += 4  # Multiply takes extra cycles
+        return
+
+    # Tested and confirmed: 11/14
+    '''
+    UMULH - Unsigned Multiply High
+    umulh rd, rn, rm
+    Returns upper 64 bits of 128-bit unsigned product
+    '''
+    if (re.match('umulh {},{},{}$'.format(rg, rg, rg), line)):
+        rd = re.findall(rg, line)[0]
+        rn = re.findall(rg, line)[1]
+        rm = re.findall(rg, line)[2]
+        if (ld_dst == rn or ld_dst == rm) and (current_cycle - ld_cycle <= 2):
+            cycle_count += 1
+        reg[rd] = umulh(reg[rn], reg[rm])
+        last_dst = rd
+        cycle_count += 4  # Multiply takes extra cycles
+        return
+
+    # Original Instructions
+
+    # Tested and confirmed: 11/15
     '''ldursw instructions'''
     # ldursw rt, [rn]
     # dollar sign so it doesn't match post index
@@ -579,6 +1300,7 @@ def execute(line: str):
         ld_dst = rt
         return
 
+    # Tested and confirmed: 11/15
     '''ldurh instructions'''
     # ldurh rt, [rn]
     # dollar sign so it doesn't match post index
@@ -634,6 +1356,7 @@ def execute(line: str):
         ld_dst = rt
         return
 
+    # Tested and confirmed: 11/16
     '''ldurb instructions'''
     # ldurb rt, [rn]
     # dollar sign so it doesn't match post index
@@ -689,6 +1412,7 @@ def execute(line: str):
         ld_dst = rt
         return
 
+    # Tested and confirmed: 11/16
     '''
     ldur instructions
     '''
@@ -750,6 +1474,7 @@ def execute(line: str):
         ld_cycle = current_cycle
         ld_dst = rt
         return
+    # Tested and confirmed: 11/17
     '''sturw instruction'''
     # sturw rt, [rn]
     # dollar sign so it doesn't match post index
@@ -796,6 +1521,7 @@ def execute(line: str):
         register_bytes = list(int.to_bytes((reg[rt]), 8, 'little', signed=True))
         mem[addr:addr + 4] = register_bytes[:4]
         return
+    # Tested and confirmed: 11/17
     '''sturh instruction'''
     # sturh rt, [rn]
     # dollar sign so it doesn't match post index
@@ -842,6 +1568,7 @@ def execute(line: str):
         register_bytes = list(int.to_bytes((reg[rt]), 8, 'little', signed=True))
         mem[addr:addr + 2] = register_bytes[:2]
         return
+    # Tested and confirmed: 11/18
     '''sturb instruction'''
     # sturb rt, [rn]
     # dollar sign so it doesn't match post index
@@ -887,6 +1614,7 @@ def execute(line: str):
         register_bytes = list(int.to_bytes((reg[rt]), 8, 'little', signed=True))
         mem[addr:addr + 1] = register_bytes[:1]
         return
+    # Tested and confirmed: 11/18
     '''
     stur instructions
     '''
@@ -929,6 +1657,7 @@ def execute(line: str):
             raise ValueError("out of bounds memory access: {}".format(line))
         mem[addr:addr + 8] = list(int.to_bytes((reg[rt]), 8, 'little'))
         return
+    # Tested and confirmed: 11/19
     '''
     mov instructions
     '''
@@ -948,6 +1677,7 @@ def execute(line: str):
         reg[rd] = reg[rn]
         last_dst = rd
         return
+    # Tested and confirmed: 11/19
     '''
     arithmetic instructions
     '''
@@ -962,7 +1692,7 @@ def execute(line: str):
         last_dst = rd
         return
     # asr rd, rn, rm
-    if (re.match('asr {},{},{}$'.format(rg, rg, num), line)):
+    if (re.match('asr {},{},{}$'.format(rg, rg, rg), line)):
         rd = re.findall(rg, line)[0]
         rn = re.findall(rg, line)[1]
         rm = re.findall(rg, line)[2]
@@ -1102,6 +1832,7 @@ def execute(line: str):
         reg[rd] = reg[rn] // reg[rm]
         last_dst = rd
         return
+    # Tested and confirmed: 11/20
     '''
     compare instructions
     '''
@@ -1128,6 +1859,7 @@ def execute(line: str):
         flag_cycle = current_cycle
         last_dst = rn
         return
+    # Tested and confirmed: 11/21
     '''
     logical instructions
     '''
@@ -1215,6 +1947,7 @@ def execute(line: str):
             flag_cycle = current_cycle
         last_dst = rd
         return
+    # Tested and confirmed: 11/22
     '''
     branch instructions
     NB. A value error is raised if a register is included where it shouldn't be
@@ -1341,6 +2074,26 @@ def execute(line: str):
             pc = asm.index(label + ':')
             cycle_count += 1
         return
+    # b.vs <label> - Branch if overflow set (V=1)
+    if (re.match('b\.?vs {}$'.format(lab), line)):
+        if (len(re.findall(rg, line)) != 0): raise ValueError("bvs takes no registers")
+        label = re.findall(lab, line)[-1]
+        if (current_cycle - flag_cycle <= 1):
+            cycle_count += 1
+        if (v_flag):
+            pc = asm.index(label + ':')
+            cycle_count += 1
+        return
+    # b.vc <label> - Branch if overflow clear (V=0)
+    if (re.match('b\.?vc {}$'.format(lab), line)):
+        if (len(re.findall(rg, line)) != 0): raise ValueError("bvc takes no registers")
+        label = re.findall(lab, line)[-1]
+        if (current_cycle - flag_cycle <= 1):
+            cycle_count += 1
+        if (not v_flag):
+            pc = asm.index(label + ':')
+            cycle_count += 1
+        return
     # bl <label>
     # bl can branch to a local assembly procedure or to an externally defined
     # python function
@@ -1369,6 +2122,7 @@ def execute(line: str):
         pc = addr
         cycle_count += 1
         return
+    # Tested and confirmed: 11/24
     '''
     system call handler
     Currently supported: Read and write to stdin/stdout, getrandom
@@ -1450,6 +2204,8 @@ was stored in sym_table during the parse stage:
 3 -> hword
 4 -> word
 5 -> byte
+6 -> double
+7 -> float
 Since the size of each variable is stored we can print out all data
 
 Examples:
@@ -1478,6 +2234,18 @@ get_data('steps')
 returns the list
 [0,0,0,0,0,0,0]
 (assuming nothing has been put there)
+
+Given
+pi: .double 3.14159265359
+get_data('pi')
+returns the list
+[3.14159265359]
+
+Given
+floats: .float 1.5, 2.5, 3.5
+get_data('floats')
+returns the list
+[1.5, 2.5, 3.5]
 '''
 
 
@@ -1514,6 +2282,18 @@ def getdata(variable: str):
             lst = []
             for i in range(0, size, 1):
                 lst.append(int.from_bytes(bytes(mem[index + i:index + i + 1]), 'little'))
+            return lst
+        # double
+        elif (sym_table[variable + '_TYPE_'] == 6):
+            lst = []
+            for i in range(0, size, 8):
+                lst.append(bytes_to_double(mem[index + i:index + i + 8]))
+            return lst
+        # float
+        elif (sym_table[variable + '_TYPE_'] == 7):
+            lst = []
+            for i in range(0, size, 4):
+                lst.append(bytes_to_float(mem[index + i:index + i + 4]))
             return lst
         else:
             print(variable + ': variable not found')
@@ -1656,7 +2436,7 @@ and affected registers after executing each instruction.
 
 
 def repl():
-    global n_flag, z_flag, register_regex
+    global n_flag, z_flag, c_flag, v_flag, register_regex, fp_double_regex, fp_single_regex
     print('armsim repl. operations on memory not supported\ntype q to quit')
     instr = ''
     while (True):
@@ -1666,9 +2446,15 @@ def repl():
         if (not instr): continue
         try:
             execute(instr)
+            # Print integer registers used
             for r in set(re.findall(register_regex, instr)):
                 print("{}: {}".format(r, reg[r]))
-            print("Z: {} N: {}".format(n_flag, z_flag))
+            # Print floating point registers used
+            for r in set(re.findall(fp_double_regex, instr)):
+                print("{}: {}".format(r, fp_reg[r]))
+            for r in set(re.findall(fp_single_regex, instr)):
+                print("{}: {}".format(r, get_s_register(r)))
+            print("Z: {} N: {} C: {} V: {}".format(z_flag, n_flag, c_flag, v_flag))
         except ValueError as e:
             print(e)
     return
@@ -1680,22 +2466,26 @@ A procedure to return the simulator to it's initial state
 
 
 def reset():
-    global reg, z_flag, n_flag, pc
+    global reg, fp_reg, z_flag, n_flag, c_flag, v_flag, pc
     global require_recursion, forbid_recursion, forbid_loops
     global cycle_count, execute_count
     global ld_cycle, ld_dst
     global flag_cycle, last_dst
     global linked_labels
+    global exclusive_monitor, exclusive_monitor_active
     forbidden_instructions.clear()
     require_recursion = False
     forbid_recursion = False
     forbid_loops = False
     reg = {r: 0 for r in reg}
+    fp_reg = {r: 0.0 for r in fp_reg}
     mem.clear()
     asm.clear()
     sym_table.clear()
-    n_flag = False;
+    n_flag = False
     z_flag = False
+    c_flag = False
+    v_flag = False
     pc = 0
     cycle_count = 0
     execute_count = 0
@@ -1703,6 +2493,8 @@ def reset():
     flag_cycle = -1
     last_dst = -1
     linked_labels = {}
+    exclusive_monitor = None
+    exclusive_monitor_active = False
 
 
 def main():
