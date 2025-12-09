@@ -1,6 +1,8 @@
 import re
 import sys
 import os
+import struct
+import math
 
 '''
 *******************
@@ -19,11 +21,15 @@ the instruction format, and updating global variables appropriately
 based on that execution. All text is converted to lower case, 
 meaning that identifiers are not case sensitive 
 (so variable = VARIABLE).
+
 Currently supported:
   System Calls:
     read      0x3f  (63) --stdin only
     write     0x40  (64) --stdout only
     getrandom 0x116 (278)
+    brk       0xd6  (214)
+    exit      0x5d  (93)
+    
   Labels:
     Can be any text (current no numbers) prepended with
     any number of periods or underscores and should end in 
@@ -31,6 +37,7 @@ Currently supported:
     text is converted to lowercase, LABEL: and label: would 
     count as the same. Labels must be declared on their OWN 
     line.
+    
   Directives:
     .data    (declare a region of initialized data)
         .asciz   (declare a string in the .data section)
@@ -38,10 +45,26 @@ Currently supported:
         .word    (declare an array of [4 bytes] words in the .data section)
         .hword   (declare an array of [2 bytes] half words in the .data section)
         .byte    (declare an array of bytes in the .data section)
+        .double  (declare an array of double-precision floats [8 bytes] in the .data section)
+        .float   (declare an array of single-precision floats [4 bytes] in the .data section)
         =        (assignment of a variable to a constant value within the .data section)
-        = . -      (find the length of the previously declared item within the .data section)
+        = . -    (find the length of the previously declared item within the .data section)
     .bss     (declare a region of unitialized data)
         .space   (declare an empty buffer in the .bss section)
+
+  Registers:
+    General Purpose:
+        x0-x28   (64-bit general purpose registers)
+        fp       (frame pointer, alias for x29)
+        lr       (link register, alias for x30)
+        sp       (stack pointer)
+        xzr      (zero register, always reads as 0)
+    
+    Floating Point:
+        d0-d31   (64-bit double-precision floating point registers)
+        s0-s31   (32-bit single-precision floating point registers)
+                 Note: S registers are aliased to the lower 32 bits of 
+                 corresponding D registers (s0 is lower 32 bits of d0, etc.)
 
   Instructions:
     **{s} means that 's' can be optionally added to the end of an
@@ -51,13 +74,15 @@ Currently supported:
     rn      = first register operand
     rm      = second register operand
     imm     = immediate value (aka a number)
+    
+    === LOAD/STORE INSTRUCTIONS (Integer) ===
     ldursw  rt, [rn]
     ldursw  rt, [rn, imm]
     ldursw  rt, [rn, rm]
     ldurh   rt, [rn]
     ldurh   rt, [rn, imm]
-    ldursh   rt, [rn]
-    ldursh   rt, [rn, imm]
+    ldursh  rt, [rn]
+    ldursh  rt, [rn, imm]
     ldurb   rt, [rn]
     ldurb   rt, [rn, imm]
     ldursb  rt, [rn]
@@ -75,23 +100,62 @@ Currently supported:
     stur    rt, [rn]
     stur    rt, [rn, imm]
     stur    rt, [rn, rm]
+    
+    
+    === FLOATING POINT LOAD/STORE ===
+    ldurs   st, [rn]           (Load Single-precision float)
+    ldurs   st, [rn, imm]
+    ldurd   dt, [rn]           (Load Double-precision float)
+    ldurd   dt, [rn, imm]
+    sturs   st, [rn]           (Store Single-precision float)
+    sturs   st, [rn, imm]
+    sturd   dt, [rn]           (Store Double-precision float)
+    sturd   dt, [rn, imm]
+    
+    === MOVE INSTRUCTIONS ===
     mov     rd, imm
     mov     rd, rn
+    
+    === ARITHMETIC INSTRUCTIONS (Integer) ===
     sub{s}  rd, rn, imm
     sub{s}  rd, rn, rm
     add{s}  rd, rn, imm
     add{s}  rd, rn, rm
     asr     rd, rn, imm
     lsl     rd, rn, imm
+    lsr     rd, rn, imm
     udiv    rd, rn, rm
     sdiv    rd, rn, rm
     mul     rd, rn, rm
+    
+    === FLOATING POINT ARITHMETIC ===
+    fadds   sd, sn, sm         (Floating-point Add Single)
+    faddd   dd, dn, dm         (Floating-point Add Double)
+    fsubs   sd, sn, sm         (Floating-point Subtract Single)
+    fsubd   dd, dn, dm         (Floating-point Subtract Double)
+    fmuls   sd, sn, sm         (Floating-point Multiply Single)
+    fmuld   dd, dn, dm         (Floating-point Multiply Double)
+    fdivs   sd, sn, sm         (Floating-point Divide Single)
+    fdivd   dd, dn, dm         (Floating-point Divide Double)
+    
+    === FLOATING POINT COMPARE ===
+    fcmps   sn, sm             (Floating-point Compare Single - sets N,Z flags)
+    fcmpd   dn, dm             (Floating-point Compare Double - sets N,Z flags)
+    
+    
+    === LOGICAL INSTRUCTIONS ===
     and{s}  rd, rn, imm
     and{s}  rd, rn, rm
     orr{s}  rd, rn, imm
     orr{s}  rd, rn, rm
     eor{s}  rd, rn, imm
+    eor{s}  rd, rn, rm
+    
+    === COMPARE INSTRUCTIONS ===
     cmp     rn, rm
+    cmp     rn, imm
+    
+    === BRANCH INSTRUCTIONS ===
     cbnz    rn, <label>
     cbz     rn, <label>
     b       <label>
@@ -105,8 +169,9 @@ Currently supported:
     b.pl    <label>
     bl      <label>
     br lr
+    
+    === SYSTEM CALL ===
     svc 0   
-
 
 Comments (Must NOT be on same line as stuff you want read into the program):
   //text
@@ -128,20 +193,33 @@ HEAP_SIZE = 0x4000
 original_break = 0
 # points to current break
 brk = 0
+
 # dict of register names to values. Will always be numeric values
 reg = {'x0': 0, 'x1': 0, 'x2': 0, 'x3': 0, 'x4': 0, 'x5': 0, 'x6': 0, 'x7': 0, 'x8': 0, 'x9': 0, 'x10': 0,
        'x11': 0, 'x12': 0, 'x13': 0, 'x14': 0, 'x15': 0, 'x16': 0, 'x17': 0, 'x18': 0, 'x19': 0, 'x20': 0,
        'x21': 0, 'x22': 0, 'x23': 0, 'x24': 0, 'x25': 0, 'x26': 0, 'x27': 0, 'x28': 0, 'fp': 0, 'lr': 0, 'sp': 0,
        'xzr': 0}
+
+# Floating point registers (D0-D31 for double precision)
+# S registers (S0-S31) are aliased to lower 32 bits of D registers
+# We store as Python floats and convert as needed
+fp_reg = {'d0': 0.0, 'd1': 0.0, 'd2': 0.0, 'd3': 0.0, 'd4': 0.0, 'd5': 0.0, 'd6': 0.0, 'd7': 0.0,
+          'd8': 0.0, 'd9': 0.0, 'd10': 0.0, 'd11': 0.0, 'd12': 0.0, 'd13': 0.0, 'd14': 0.0, 'd15': 0.0,
+          'd16': 0.0, 'd17': 0.0, 'd18': 0.0, 'd19': 0.0, 'd20': 0.0, 'd21': 0.0, 'd22': 0.0, 'd23': 0.0,
+          'd24': 0.0, 'd25': 0.0, 'd26': 0.0, 'd27': 0.0, 'd28': 0.0, 'd29': 0.0, 'd30': 0.0, 'd31': 0.0}
+
 # program counter
 pc = 0
+
+# Flags
 # Note: Python doesn't really have overflow and it would
 # be a pain to simulate, so the v (signed overflow) flag
-# is implicitly zero
+# is implicitly zero for integer ops, but set properly for FP compares
 # negative flag
 n_flag = False
 # zero flag
 z_flag = False
+
 
 '''
 dict to hold how often a label has been seen. Intialized in the
@@ -163,7 +241,11 @@ linked_labels = {}
 regexes for parsing instructions
 '''
 register_regex = '(?:lr|fp|sp|xzr|(?<!\w)x[1-2]\d(?!\w)|(?<!\w)x\d(?!\w))'
+# Floating point register regexes
+fp_double_regex = '(?:(?<!\w)d[1-2]\d(?!\w)|(?<!\w)d3[0-1](?!\w)|(?<!\w)d\d(?!\w))'
+fp_single_regex = '(?:(?<!\w)s[1-2]\d(?!\w)|(?<!\w)s3[0-1](?!\w)|(?<!\w)s\d(?!\w))'
 num_regex = '[-]?(?:0x[0-9a-f]+|\d+)'
+float_num_regex = '[-]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][-+]?\d+)?'
 var_regex = '[a-z_]+\w*'
 label_regex = '[.]*\w+'
 '''
@@ -183,12 +265,23 @@ register_regex:
         same explanations as above, but this is for registers x0 - x9
         again, we don't want to match registers like x90, so the negative
         lookahead is used
+        
+fp_double_regex:
+    Matches d0-d31 (double-precision floating point registers)
+    
+fp_single_regex:
+    Matches s0-s31 (single-precision floating point registers)
+    
 num_regex:
     [-]?(?:0x[0-9a-f]+|\d+)
     [-]?
         optionally matches a negative sign at the beginning
     (?:0x[0-9a-f]+|[0-9]+)
         matches either a hex number starting with 0x or a regular number
+        
+float_num_regex:
+    Matches floating point numbers including scientific notation
+    
 label_regex    
     [.]*
         a label can start with zero or more periods
@@ -209,6 +302,8 @@ Additionally the directive type will be stored in the following way:
 3 -> hword
 4 -> word
 5 -> byte
+6 -> double (new)
+7 -> float (new)
 NB. vars declared with = (ie length variables) are just stored in
 sym_table as numbers, so they don't have a type
 Types are stored primarily for the get_data procedure
@@ -263,6 +358,106 @@ ld_cycle, ld_dst = -1, -1
 flag_cycle = -1
 last_dst = -1
 
+
+# Floating Point Helper Functions
+
+def get_s_register(name):
+    """
+    Get the value of an S register (single-precision).
+    S registers are aliased to the lower 32 bits of the corresponding D register.
+    This extracts the lower 32 bits of the D register's IEEE754 representation
+    and interprets them as a single-precision float.
+    """
+    # Extract the register number
+    num = int(name[1:])
+    d_name = 'd' + str(num)
+    # Get the double value
+    double_val = fp_reg[d_name]
+    # Convert double to 8 bytes (IEEE754 double-precision)
+    double_bytes = struct.pack('<d', double_val)
+    # Extract the lower 4 bytes (little-endian, so bytes 0-3)
+    lower_bytes = double_bytes[0:4]
+    # Interpret as single-precision float
+    return struct.unpack('<f', lower_bytes)[0]
+
+
+def set_s_register(name, value):
+    """
+    Set the value of an S register (single-precision).
+    This sets the lower 32 bits of the corresponding D register's IEEE754
+    representation to the IEEE754 representation of the single-precision value.
+    The upper 32 bits are zeroed.
+    """
+    num = int(name[1:])
+    d_name = 'd' + str(num)
+    # Pack the single-precision value to get its IEEE754 bytes
+    single_bytes = struct.pack('<f', value)
+    # Create 8 bytes with single in lower 4 bytes, zeros in upper 4 bytes
+    double_bytes = single_bytes + b'\x00\x00\x00\x00'
+    # Interpret as double and store
+    fp_reg[d_name] = struct.unpack('<d', double_bytes)[0]
+
+
+def get_d_register(name):
+    """Get the value of a D register (double-precision)."""
+    return fp_reg[name]
+
+
+def set_d_register(name, value):
+    """Set the value of a D register (double-precision)."""
+    fp_reg[name] = value
+
+
+def double_to_bytes(value):
+    """Convert a double-precision float to 8 bytes (little-endian)."""
+    return list(struct.pack('<d', value))
+
+
+def bytes_to_double(byte_list):
+    """Convert 8 bytes (little-endian) to a double-precision float."""
+    return struct.unpack('<d', bytes(byte_list))[0]
+
+
+def float_to_bytes(value):
+    """Convert a single-precision float to 4 bytes (little-endian)."""
+    return list(struct.pack('<f', value))
+
+
+def bytes_to_float(byte_list):
+    """Convert 4 bytes (little-endian) to a single-precision float."""
+    return struct.unpack('<f', bytes(byte_list))[0]
+
+
+
+def set_fp_compare_flags(val1, val2):
+    """
+    Set the N and Z flags based on floating-point comparison.
+    
+    Flag settings:
+        Equal:        N=0, Z=1
+        Less than:    N=1, Z=0
+        Greater than: N=0, Z=0
+        Unordered:    N=0, Z=0 (when either operand is NaN)
+    """
+    global n_flag, z_flag
+    
+    # Check for NaN (unordered)
+    if math.isnan(val1) or math.isnan(val2):
+        n_flag = False
+        z_flag = False
+    elif val1 == val2:
+        n_flag = False
+        z_flag = True
+    elif val1 < val2:
+        n_flag = True
+        z_flag = False
+    else:  # val1 > val2
+        n_flag = False
+        z_flag = False
+
+
+
+
 '''
 This procedure reads the lines of a program (which can be a .s file
 or just a list of assembly instructions) and populates the
@@ -298,7 +493,11 @@ def parse(lines) -> None:
         # convert multiple spaces into one space
         line = re.sub('[ \t]+', ' ', line)
         if ('/*' in line and '*/' in line): continue
-        if ('//' in line): continue
+        # Handle // comments: strip everything after // (inline comments)
+        if ('//' in line):
+            line = line[:line.index('//')].strip()
+            if not line:  # Line was only a comment
+                continue
         if ("/*" in line): comment = True;continue
         if ("*/" in line): comment = False;continue
         if (".data" in line): data = True;code = False;bss = False;continue
@@ -445,6 +644,50 @@ def parse(lines) -> None:
                 continue
 
             '''
+            The .double directive is followed by a comma separated list
+            of floating point numbers. Each number will be an 8 byte entry in mem.
+            Additionally, the _SIZE_ shadow entry will be created.
+            TYPE = 6 for double
+            '''
+            if (re.match('.*:\.double.*', line)):
+                line = line.lower()
+                line = line.split(":.double")
+                # Parse floating point numbers
+                numbers = [float(x.strip()) for x in line[1].split(',')]
+                # each double is 8 bytes
+                size = len(numbers) * 8
+                for n in numbers:
+                    mem.extend(double_to_bytes(n))
+
+                sym_table[line[0]] = index
+                sym_table[line[0] + "_SIZE_"] = size
+                sym_table[line[0] + "_TYPE_"] = 6
+                index += size
+                continue
+
+            '''
+            The .float directive is followed by a comma separated list
+            of floating point numbers. Each number will be a 4 byte entry in mem.
+            Additionally, the _SIZE_ shadow entry will be created.
+            TYPE = 7 for float (single precision)
+            '''
+            if (re.match('.*:\.float.*', line)):
+                line = line.lower()
+                line = line.split(":.float")
+                # Parse floating point numbers
+                numbers = [float(x.strip()) for x in line[1].split(',')]
+                # each float is 4 bytes
+                size = len(numbers) * 4
+                for n in numbers:
+                    mem.extend(float_to_bytes(n))
+
+                sym_table[line[0]] = index
+                sym_table[line[0] + "_SIZE_"] = size
+                sym_table[line[0] + "_TYPE_"] = 7
+                index += size
+                continue
+
+            '''
             If using the len=.-str idiom to store str length, we
             lookup the length of str that we stored in sym_table
             dict when handling .asciz in the format str_SIZE_ 
@@ -505,6 +748,7 @@ def execute(line: str):
     global pc, n_flag, z_flag, label_hit_counts, mem
     global original_break, brk, STACK_SIZE, HEAP_SIZE
     global register_regex, num_regex, var_regex, label_regex
+    global fp_double_regex, fp_single_regex
     global cycle_count, execute_count, ld_cycle, ld_dst
     global flag_cycle, last_dst
     current_cycle = cycle_count
@@ -512,6 +756,9 @@ def execute(line: str):
     execute_count += 1
     last_dst = None
 
+    # Convert to lowercase for consistent matching
+    line = line.lower()
+    
     # remove spaces around commas
     line = re.sub('[ ]*,[ ]*', ',', line)
     # octothorpe is optional, remove it
@@ -522,10 +769,304 @@ def execute(line: str):
     num = num_regex
     var = var_regex
     lab = label_regex
+    dreg = fp_double_regex
+    sreg = fp_single_regex
 
     # all labels in program (better feedback for typos/malformed branches
     # [:-1] is so that the colon in the label is not included
     labels = [l[:-1] for l in asm if (re.match('{}:'.format(lab), l))]
+
+    # Floating Point Instructions
+    
+    '''
+    FADDS - Floating-point Add Single
+    fadds sd, sn, sm
+    '''
+    if (re.match('fadds {},{},{}$'.format(sreg, sreg, sreg), line)):
+        regs = re.findall(sreg, line)
+        sd, sn, sm = regs[0], regs[1], regs[2]
+        val_n = get_s_register(sn)
+        val_m = get_s_register(sm)
+        result = val_n + val_m
+        set_s_register(sd, result)
+        return
+
+    '''
+    FADDD - Floating-point Add Double
+    faddd dd, dn, dm
+    '''
+    if (re.match('faddd {},{},{}$'.format(dreg, dreg, dreg), line)):
+        regs = re.findall(dreg, line)
+        dd, dn, dm = regs[0], regs[1], regs[2]
+        val_n = get_d_register(dn)
+        val_m = get_d_register(dm)
+        result = val_n + val_m
+        set_d_register(dd, result)
+        return
+
+    '''
+    FSUBS - Floating-point Subtract Single
+    fsubs sd, sn, sm
+    '''
+    if (re.match('fsubs {},{},{}$'.format(sreg, sreg, sreg), line)):
+        regs = re.findall(sreg, line)
+        sd, sn, sm = regs[0], regs[1], regs[2]
+        val_n = get_s_register(sn)
+        val_m = get_s_register(sm)
+        result = val_n - val_m
+        set_s_register(sd, result)
+        return
+
+    '''
+    FSUBD - Floating-point Subtract Double
+    fsubd dd, dn, dm
+    '''
+    if (re.match('fsubd {},{},{}$'.format(dreg, dreg, dreg), line)):
+        regs = re.findall(dreg, line)
+        dd, dn, dm = regs[0], regs[1], regs[2]
+        val_n = get_d_register(dn)
+        val_m = get_d_register(dm)
+        result = val_n - val_m
+        set_d_register(dd, result)
+        return
+
+    '''
+    FMULS - Floating-point Multiply Single
+    fmuls sd, sn, sm
+    '''
+    if (re.match('fmuls {},{},{}$'.format(sreg, sreg, sreg), line)):
+        regs = re.findall(sreg, line)
+        sd, sn, sm = regs[0], regs[1], regs[2]
+        val_n = get_s_register(sn)
+        val_m = get_s_register(sm)
+        result = val_n * val_m
+        set_s_register(sd, result)
+        cycle_count += 4  # Multiply takes extra cycles
+        return
+
+    '''
+    FMULD - Floating-point Multiply Double
+    fmuld dd, dn, dm
+    '''
+    if (re.match('fmuld {},{},{}$'.format(dreg, dreg, dreg), line)):
+        regs = re.findall(dreg, line)
+        dd, dn, dm = regs[0], regs[1], regs[2]
+        val_n = get_d_register(dn)
+        val_m = get_d_register(dm)
+        result = val_n * val_m
+        set_d_register(dd, result)
+        cycle_count += 4  # Multiply takes extra cycles
+        return
+
+    '''
+    FDIVS - Floating-point Divide Single
+    fdivs sd, sn, sm
+    '''
+    if (re.match('fdivs {},{},{}$'.format(sreg, sreg, sreg), line)):
+        regs = re.findall(sreg, line)
+        sd, sn, sm = regs[0], regs[1], regs[2]
+        val_n = get_s_register(sn)
+        val_m = get_s_register(sm)
+        if val_m == 0.0:
+            if val_n == 0.0:
+                result = float('nan')
+            elif val_n > 0:
+                result = float('inf')
+            else:
+                result = float('-inf')
+        else:
+            result = val_n / val_m
+        set_s_register(sd, result)
+        cycle_count += 10  # Division takes many cycles
+        return
+
+    '''
+    FDIVD - Floating-point Divide Double
+    fdivd dd, dn, dm
+    '''
+    if (re.match('fdivd {},{},{}$'.format(dreg, dreg, dreg), line)):
+        regs = re.findall(dreg, line)
+        dd, dn, dm = regs[0], regs[1], regs[2]
+        val_n = get_d_register(dn)
+        val_m = get_d_register(dm)
+        if val_m == 0.0:
+            if val_n == 0.0:
+                result = float('nan')
+            elif val_n > 0:
+                result = float('inf')
+            else:
+                result = float('-inf')
+        else:
+            result = val_n / val_m
+        set_d_register(dd, result)
+        cycle_count += 10  # Division takes many cycles
+        return
+
+    '''
+    FCMPS - Floating-point Compare Single
+    fcmps sn, sm
+    Sets N, Z, C, V flags based on comparison
+    '''
+    if (re.match('fcmps {},{}$'.format(sreg, sreg), line)):
+        regs = re.findall(sreg, line)
+        sn, sm = regs[0], regs[1]
+        val_n = get_s_register(sn)
+        val_m = get_s_register(sm)
+        set_fp_compare_flags(val_n, val_m)
+        flag_cycle = current_cycle
+        return
+
+    '''
+    FCMPD - Floating-point Compare Double
+    fcmpd dn, dm
+    Sets N, Z, C, V flags based on comparison
+    '''
+    if (re.match('fcmpd {},{}$'.format(dreg, dreg), line)):
+        regs = re.findall(dreg, line)
+        dn, dm = regs[0], regs[1]
+        val_n = get_d_register(dn)
+        val_m = get_d_register(dm)
+        set_fp_compare_flags(val_n, val_m)
+        flag_cycle = current_cycle
+        return
+
+    '''
+    LDURS - Load Single floating point
+    ldurs st, [rn]
+    ldurs st, [rn, imm]
+    '''
+    # ldurs st, [rn]
+    if (re.match('ldurs {},\[{}\]$'.format(sreg, rg), line)):
+        st = re.findall(sreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle) <= 2:
+            cycle_count += 1
+        addr = reg[rn]
+        if (addr < reg['sp'] or addr > len(mem) - 4):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = bytes_to_float(mem[addr:addr + 4])
+        set_s_register(st, value)
+        ld_cycle = current_cycle
+        ld_dst = st
+        return
+
+    # ldurs st, [rn, imm]
+    if (re.match('ldurs {},\[{},{}\]$'.format(sreg, rg, num), line)):
+        st = re.findall(sreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle) <= 2:
+            cycle_count += 1
+        imm = int(re.findall(num, line)[-1], 0)
+        addr = reg[rn] + imm
+        if (addr < reg['sp'] or addr > len(mem) - 4):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = bytes_to_float(mem[addr:addr + 4])
+        set_s_register(st, value)
+        ld_cycle = current_cycle
+        ld_dst = st
+        return
+
+    '''
+    LDURD - Load Double floating point
+    ldurd dt, [rn]
+    ldurd dt, [rn, imm]
+    '''
+    # ldurd dt, [rn]
+    if (re.match('ldurd {},\[{}\]$'.format(dreg, rg), line)):
+        dt = re.findall(dreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle) <= 2:
+            cycle_count += 1
+        addr = reg[rn]
+        if (addr < reg['sp'] or addr > len(mem) - 8):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = bytes_to_double(mem[addr:addr + 8])
+        set_d_register(dt, value)
+        ld_cycle = current_cycle
+        ld_dst = dt
+        return
+
+    # ldurd dt, [rn, imm]
+    if (re.match('ldurd {},\[{},{}\]$'.format(dreg, rg, num), line)):
+        dt = re.findall(dreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle) <= 2:
+            cycle_count += 1
+        imm = int(re.findall(num, line)[-1], 0)
+        addr = reg[rn] + imm
+        if (addr < reg['sp'] or addr > len(mem) - 8):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = bytes_to_double(mem[addr:addr + 8])
+        set_d_register(dt, value)
+        ld_cycle = current_cycle
+        ld_dst = dt
+        return
+
+    '''
+    STURS - Store Single floating point
+    sturs st, [rn]
+    sturs st, [rn, imm]
+    '''
+    # sturs st, [rn]
+    if (re.match('sturs {},\[{}\]$'.format(sreg, rg), line)):
+        st = re.findall(sreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle <= 2):
+            cycle_count += (current_cycle - ld_cycle)
+        addr = reg[rn]
+        if (addr < reg['sp'] or addr > len(mem) - 4):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = get_s_register(st)
+        mem[addr:addr + 4] = float_to_bytes(value)
+        return
+
+    # sturs st, [rn, imm]
+    if (re.match('sturs {},\[{},{}\]$'.format(sreg, rg, num), line)):
+        st = re.findall(sreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle <= 2):
+            cycle_count += (current_cycle - ld_cycle)
+        imm = int(re.findall(num, line)[-1], 0)
+        addr = reg[rn] + imm
+        if (addr < reg['sp'] or addr > len(mem) - 4):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = get_s_register(st)
+        mem[addr:addr + 4] = float_to_bytes(value)
+        return
+
+    '''
+    STURD - Store Double floating point
+    sturd dt, [rn]
+    sturd dt, [rn, imm]
+    '''
+    # sturd dt, [rn]
+    if (re.match('sturd {},\[{}\]$'.format(dreg, rg), line)):
+        dt = re.findall(dreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle <= 2):
+            cycle_count += (current_cycle - ld_cycle)
+        addr = reg[rn]
+        if (addr < reg['sp'] or addr > len(mem) - 8):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = get_d_register(dt)
+        mem[addr:addr + 8] = double_to_bytes(value)
+        return
+
+    # sturd dt, [rn, imm]
+    if (re.match('sturd {},\[{},{}\]$'.format(dreg, rg, num), line)):
+        dt = re.findall(dreg, line)[0]
+        rn = re.findall(rg, line)[0]
+        if ld_dst == rn and (current_cycle - ld_cycle <= 2):
+            cycle_count += (current_cycle - ld_cycle)
+        imm = int(re.findall(num, line)[-1], 0)
+        addr = reg[rn] + imm
+        if (addr < reg['sp'] or addr > len(mem) - 8):
+            raise ValueError("out of bounds memory access: {}".format(line))
+        value = get_d_register(dt)
+        mem[addr:addr + 8] = double_to_bytes(value)
+        return
+
+    # Original Instructions
 
     '''ldursw instructions'''
     # ldursw rt, [rn]
@@ -962,7 +1503,7 @@ def execute(line: str):
         last_dst = rd
         return
     # asr rd, rn, rm
-    if (re.match('asr {},{},{}$'.format(rg, rg, num), line)):
+    if (re.match('asr {},{},{}$'.format(rg, rg, rg), line)):
         rd = re.findall(rg, line)[0]
         rn = re.findall(rg, line)[1]
         rm = re.findall(rg, line)[2]
@@ -1450,6 +1991,8 @@ was stored in sym_table during the parse stage:
 3 -> hword
 4 -> word
 5 -> byte
+6 -> double
+7 -> float
 Since the size of each variable is stored we can print out all data
 
 Examples:
@@ -1478,6 +2021,18 @@ get_data('steps')
 returns the list
 [0,0,0,0,0,0,0]
 (assuming nothing has been put there)
+
+Given
+pi: .double 3.14159265359
+get_data('pi')
+returns the list
+[3.14159265359]
+
+Given
+floats: .float 1.5, 2.5, 3.5
+get_data('floats')
+returns the list
+[1.5, 2.5, 3.5]
 '''
 
 
@@ -1514,6 +2069,18 @@ def getdata(variable: str):
             lst = []
             for i in range(0, size, 1):
                 lst.append(int.from_bytes(bytes(mem[index + i:index + i + 1]), 'little'))
+            return lst
+        # double
+        elif (sym_table[variable + '_TYPE_'] == 6):
+            lst = []
+            for i in range(0, size, 8):
+                lst.append(bytes_to_double(mem[index + i:index + i + 8]))
+            return lst
+        # float
+        elif (sym_table[variable + '_TYPE_'] == 7):
+            lst = []
+            for i in range(0, size, 4):
+                lst.append(bytes_to_float(mem[index + i:index + i + 4]))
             return lst
         else:
             print(variable + ': variable not found')
@@ -1656,7 +2223,7 @@ and affected registers after executing each instruction.
 
 
 def repl():
-    global n_flag, z_flag, register_regex
+    global n_flag, z_flag, register_regex, fp_double_regex, fp_single_regex
     print('armsim repl. operations on memory not supported\ntype q to quit')
     instr = ''
     while (True):
@@ -1666,9 +2233,15 @@ def repl():
         if (not instr): continue
         try:
             execute(instr)
+            # Print integer registers used
             for r in set(re.findall(register_regex, instr)):
                 print("{}: {}".format(r, reg[r]))
-            print("Z: {} N: {}".format(n_flag, z_flag))
+            # Print floating point registers used
+            for r in set(re.findall(fp_double_regex, instr)):
+                print("{}: {}".format(r, fp_reg[r]))
+            for r in set(re.findall(fp_single_regex, instr)):
+                print("{}: {}".format(r, get_s_register(r)))
+            print("Z: {} N: {}".format(z_flag, n_flag))
         except ValueError as e:
             print(e)
     return
@@ -1680,7 +2253,7 @@ A procedure to return the simulator to it's initial state
 
 
 def reset():
-    global reg, z_flag, n_flag, pc
+    global reg, fp_reg, z_flag, n_flag, pc
     global require_recursion, forbid_recursion, forbid_loops
     global cycle_count, execute_count
     global ld_cycle, ld_dst
@@ -1691,10 +2264,11 @@ def reset():
     forbid_recursion = False
     forbid_loops = False
     reg = {r: 0 for r in reg}
+    fp_reg = {r: 0.0 for r in fp_reg}
     mem.clear()
     asm.clear()
     sym_table.clear()
-    n_flag = False;
+    n_flag = False
     z_flag = False
     pc = 0
     cycle_count = 0
