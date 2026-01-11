@@ -1,6 +1,7 @@
 import re
 import sys
 import os
+import struct
 
 '''
 *******************
@@ -19,11 +20,15 @@ the instruction format, and updating global variables appropriately
 based on that execution. All text is converted to lower case, 
 meaning that identifiers are not case sensitive 
 (so variable = VARIABLE).
+
 Currently supported:
   System Calls:
     read      0x3f  (63) --stdin only
     write     0x40  (64) --stdout only
     getrandom 0x116 (278)
+    brk       0xd6  (214)
+    exit      0x5d  (93)
+    
   Labels:
     Can be any text (current no numbers) prepended with
     any number of periods or underscores and should end in 
@@ -31,6 +36,7 @@ Currently supported:
     text is converted to lowercase, LABEL: and label: would 
     count as the same. Labels must be declared on their OWN 
     line.
+    
   Directives:
     .data    (declare a region of initialized data)
         .asciz   (declare a string in the .data section)
@@ -39,10 +45,18 @@ Currently supported:
         .hword   (declare an array of [2 bytes] half words in the .data section)
         .byte    (declare an array of bytes in the .data section)
         =        (assignment of a variable to a constant value within the .data section)
-        = . -      (find the length of the previously declared item within the .data section)
+        = . -    (find the length of the previously declared item within the .data section)
     .bss     (declare a region of unitialized data)
         .space   (declare an empty buffer in the .bss section)
 
+  Registers:
+    General Purpose:
+        x0-x28   (64-bit general purpose registers)
+        fp       (frame pointer, alias for x29)
+        lr       (link register, alias for x30)
+        sp       (stack pointer)
+        xzr      (zero register, always reads as 0)
+    
   Instructions:
     **{s} means that 's' can be optionally added to the end of an
     instruction to make the result affect the flags**
@@ -51,13 +65,15 @@ Currently supported:
     rn      = first register operand
     rm      = second register operand
     imm     = immediate value (aka a number)
+    
+    === LOAD/STORE INSTRUCTIONS (Integer) ===
     ldursw  rt, [rn]
     ldursw  rt, [rn, imm]
     ldursw  rt, [rn, rm]
     ldurh   rt, [rn]
     ldurh   rt, [rn, imm]
-    ldursh   rt, [rn]
-    ldursh   rt, [rn, imm]
+    ldursh  rt, [rn]
+    ldursh  rt, [rn, imm]
     ldurb   rt, [rn]
     ldurb   rt, [rn, imm]
     ldursb  rt, [rn]
@@ -75,23 +91,39 @@ Currently supported:
     stur    rt, [rn]
     stur    rt, [rn, imm]
     stur    rt, [rn, rm]
+    
+    
+    
+    === MOVE INSTRUCTIONS ===
     mov     rd, imm
     mov     rd, rn
+    
+    === ARITHMETIC INSTRUCTIONS (Integer) ===
     sub{s}  rd, rn, imm
     sub{s}  rd, rn, rm
     add{s}  rd, rn, imm
     add{s}  rd, rn, rm
     asr     rd, rn, imm
     lsl     rd, rn, imm
+    lsr     rd, rn, imm
     udiv    rd, rn, rm
     sdiv    rd, rn, rm
     mul     rd, rn, rm
+    
+    
+    === LOGICAL INSTRUCTIONS ===
     and{s}  rd, rn, imm
     and{s}  rd, rn, rm
     orr{s}  rd, rn, imm
     orr{s}  rd, rn, rm
     eor{s}  rd, rn, imm
+    eor{s}  rd, rn, rm
+    
+    === COMPARE INSTRUCTIONS ===
     cmp     rn, rm
+    cmp     rn, imm
+    
+    === BRANCH INSTRUCTIONS ===
     cbnz    rn, <label>
     cbz     rn, <label>
     b       <label>
@@ -103,10 +135,13 @@ Currently supported:
     b.ne    <label>
     b.mi    <label>
     b.pl    <label>
+    b.vs    <label>            (Branch if overflow set - V=1)
+    b.vc    <label>            (Branch if overflow clear - V=0)
     bl      <label>
     br lr
+    
+    === SYSTEM CALL ===
     svc 0   
-
 
 Comments (Must NOT be on same line as stuff you want read into the program):
   //text
@@ -128,20 +163,30 @@ HEAP_SIZE = 0x4000
 original_break = 0
 # points to current break
 brk = 0
+
 # dict of register names to values. Will always be numeric values
 reg = {'x0': 0, 'x1': 0, 'x2': 0, 'x3': 0, 'x4': 0, 'x5': 0, 'x6': 0, 'x7': 0, 'x8': 0, 'x9': 0, 'x10': 0,
        'x11': 0, 'x12': 0, 'x13': 0, 'x14': 0, 'x15': 0, 'x16': 0, 'x17': 0, 'x18': 0, 'x19': 0, 'x20': 0,
        'x21': 0, 'x22': 0, 'x23': 0, 'x24': 0, 'x25': 0, 'x26': 0, 'x27': 0, 'x28': 0, 'fp': 0, 'lr': 0, 'sp': 0,
        'xzr': 0}
+
+
 # program counter
 pc = 0
+
+# Flags
 # Note: Python doesn't really have overflow and it would
 # be a pain to simulate, so the v (signed overflow) flag
-# is implicitly zero
+# is implicitly zero for integer ops, but set properly for FP compares
 # negative flag
 n_flag = False
 # zero flag
 z_flag = False
+# carry flag (used for FP compares)
+c_flag = False
+# overflow flag (used for FP compares to indicate unordered/NaN)
+v_flag = False
+
 
 '''
 dict to hold how often a label has been seen. Intialized in the
@@ -163,7 +208,11 @@ linked_labels = {}
 regexes for parsing instructions
 '''
 register_regex = '(?:lr|fp|sp|xzr|(?<!\w)x[1-2]\d(?!\w)|(?<!\w)x\d(?!\w))'
+# Floating point register regexes
+fp_double_regex = '(?:(?<!\w)d[1-2]\d(?!\w)|(?<!\w)d3[0-1](?!\w)|(?<!\w)d\d(?!\w))'
+fp_single_regex = '(?:(?<!\w)s[1-2]\d(?!\w)|(?<!\w)s3[0-1](?!\w)|(?<!\w)s\d(?!\w))'
 num_regex = '[-]?(?:0x[0-9a-f]+|\d+)'
+float_num_regex = '[-]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][-+]?\d+)?'
 var_regex = '[a-z_]+\w*'
 label_regex = '[.]*\w+'
 '''
@@ -183,12 +232,23 @@ register_regex:
         same explanations as above, but this is for registers x0 - x9
         again, we don't want to match registers like x90, so the negative
         lookahead is used
+        
+fp_double_regex:
+    Matches d0-d31 (double-precision floating point registers)
+    
+fp_single_regex:
+    Matches s0-s31 (single-precision floating point registers)
+    
 num_regex:
     [-]?(?:0x[0-9a-f]+|\d+)
     [-]?
         optionally matches a negative sign at the beginning
     (?:0x[0-9a-f]+|[0-9]+)
         matches either a hex number starting with 0x or a regular number
+        
+float_num_regex:
+    Matches floating point numbers including scientific notation
+    
 label_regex    
     [.]*
         a label can start with zero or more periods
@@ -209,6 +269,8 @@ Additionally the directive type will be stored in the following way:
 3 -> hword
 4 -> word
 5 -> byte
+6 -> double (new)
+7 -> float (new)
 NB. vars declared with = (ie length variables) are just stored in
 sym_table as numbers, so they don't have a type
 Types are stored primarily for the get_data procedure
@@ -263,6 +325,10 @@ ld_cycle, ld_dst = -1, -1
 flag_cycle = -1
 last_dst = -1
 
+
+
+
+
 '''
 This procedure reads the lines of a program (which can be a .s file
 or just a list of assembly instructions) and populates the
@@ -298,7 +364,11 @@ def parse(lines) -> None:
         # convert multiple spaces into one space
         line = re.sub('[ \t]+', ' ', line)
         if ('/*' in line and '*/' in line): continue
-        if ('//' in line): continue
+        # Handle // comments: strip everything after // (inline comments)
+        if ('//' in line):
+            line = line[:line.index('//')].strip()
+            if not line:  # Line was only a comment
+                continue
         if ("/*" in line): comment = True;continue
         if ("*/" in line): comment = False;continue
         if (".data" in line): data = True;code = False;bss = False;continue
@@ -502,9 +572,10 @@ an error is raised
 
 
 def execute(line: str):
-    global pc, n_flag, z_flag, label_hit_counts, mem
+    global pc, n_flag, z_flag, c_flag, v_flag, label_hit_counts, mem
     global original_break, brk, STACK_SIZE, HEAP_SIZE
     global register_regex, num_regex, var_regex, label_regex
+    global fp_double_regex, fp_single_regex
     global cycle_count, execute_count, ld_cycle, ld_dst
     global flag_cycle, last_dst
     current_cycle = cycle_count
@@ -512,6 +583,9 @@ def execute(line: str):
     execute_count += 1
     last_dst = None
 
+    # Convert to lowercase for consistent matching
+    line = line.lower()
+    
     # remove spaces around commas
     line = re.sub('[ ]*,[ ]*', ',', line)
     # octothorpe is optional, remove it
@@ -522,11 +596,16 @@ def execute(line: str):
     num = num_regex
     var = var_regex
     lab = label_regex
+    dreg = fp_double_regex
+    sreg = fp_single_regex
 
     # all labels in program (better feedback for typos/malformed branches
     # [:-1] is so that the colon in the label is not included
     labels = [l[:-1] for l in asm if (re.match('{}:'.format(lab), l))]
 
+    # Original Instructions
+
+    # Tested and confirmed: 11/15
     '''ldursw instructions'''
     # ldursw rt, [rn]
     # dollar sign so it doesn't match post index
@@ -579,6 +658,7 @@ def execute(line: str):
         ld_dst = rt
         return
 
+    # Tested and confirmed: 11/15
     '''ldurh instructions'''
     # ldurh rt, [rn]
     # dollar sign so it doesn't match post index
@@ -634,6 +714,7 @@ def execute(line: str):
         ld_dst = rt
         return
 
+    # Tested and confirmed: 11/16
     '''ldurb instructions'''
     # ldurb rt, [rn]
     # dollar sign so it doesn't match post index
@@ -689,6 +770,7 @@ def execute(line: str):
         ld_dst = rt
         return
 
+    # Tested and confirmed: 11/16
     '''
     ldur instructions
     '''
@@ -750,6 +832,7 @@ def execute(line: str):
         ld_cycle = current_cycle
         ld_dst = rt
         return
+    # Tested and confirmed: 11/17
     '''sturw instruction'''
     # sturw rt, [rn]
     # dollar sign so it doesn't match post index
@@ -796,6 +879,7 @@ def execute(line: str):
         register_bytes = list(int.to_bytes((reg[rt]), 8, 'little', signed=True))
         mem[addr:addr + 4] = register_bytes[:4]
         return
+    # Tested and confirmed: 11/17
     '''sturh instruction'''
     # sturh rt, [rn]
     # dollar sign so it doesn't match post index
@@ -842,6 +926,7 @@ def execute(line: str):
         register_bytes = list(int.to_bytes((reg[rt]), 8, 'little', signed=True))
         mem[addr:addr + 2] = register_bytes[:2]
         return
+    # Tested and confirmed: 11/18
     '''sturb instruction'''
     # sturb rt, [rn]
     # dollar sign so it doesn't match post index
@@ -887,6 +972,7 @@ def execute(line: str):
         register_bytes = list(int.to_bytes((reg[rt]), 8, 'little', signed=True))
         mem[addr:addr + 1] = register_bytes[:1]
         return
+    # Tested and confirmed: 11/18
     '''
     stur instructions
     '''
@@ -929,6 +1015,7 @@ def execute(line: str):
             raise ValueError("out of bounds memory access: {}".format(line))
         mem[addr:addr + 8] = list(int.to_bytes((reg[rt]), 8, 'little'))
         return
+    # Tested and confirmed: 11/19
     '''
     mov instructions
     '''
@@ -948,6 +1035,7 @@ def execute(line: str):
         reg[rd] = reg[rn]
         last_dst = rd
         return
+    # Tested and confirmed: 11/19
     '''
     arithmetic instructions
     '''
@@ -962,7 +1050,7 @@ def execute(line: str):
         last_dst = rd
         return
     # asr rd, rn, rm
-    if (re.match('asr {},{},{}$'.format(rg, rg, num), line)):
+    if (re.match('asr {},{},{}$'.format(rg, rg, rg), line)):
         rd = re.findall(rg, line)[0]
         rn = re.findall(rg, line)[1]
         rm = re.findall(rg, line)[2]
@@ -1102,6 +1190,7 @@ def execute(line: str):
         reg[rd] = reg[rn] // reg[rm]
         last_dst = rd
         return
+    # Tested and confirmed: 11/20
     '''
     compare instructions
     '''
@@ -1128,6 +1217,7 @@ def execute(line: str):
         flag_cycle = current_cycle
         last_dst = rn
         return
+    # Tested and confirmed: 11/21
     '''
     logical instructions
     '''
@@ -1215,6 +1305,7 @@ def execute(line: str):
             flag_cycle = current_cycle
         last_dst = rd
         return
+    # Tested and confirmed: 11/22
     '''
     branch instructions
     NB. A value error is raised if a register is included where it shouldn't be
@@ -1341,6 +1432,26 @@ def execute(line: str):
             pc = asm.index(label + ':')
             cycle_count += 1
         return
+    # b.vs <label> - Branch if overflow set (V=1)
+    if (re.match('b\.?vs {}$'.format(lab), line)):
+        if (len(re.findall(rg, line)) != 0): raise ValueError("bvs takes no registers")
+        label = re.findall(lab, line)[-1]
+        if (current_cycle - flag_cycle <= 1):
+            cycle_count += 1
+        if (v_flag):
+            pc = asm.index(label + ':')
+            cycle_count += 1
+        return
+    # b.vc <label> - Branch if overflow clear (V=0)
+    if (re.match('b\.?vc {}$'.format(lab), line)):
+        if (len(re.findall(rg, line)) != 0): raise ValueError("bvc takes no registers")
+        label = re.findall(lab, line)[-1]
+        if (current_cycle - flag_cycle <= 1):
+            cycle_count += 1
+        if (not v_flag):
+            pc = asm.index(label + ':')
+            cycle_count += 1
+        return
     # bl <label>
     # bl can branch to a local assembly procedure or to an externally defined
     # python function
@@ -1369,6 +1480,7 @@ def execute(line: str):
         pc = addr
         cycle_count += 1
         return
+    # Tested and confirmed: 11/24
     '''
     system call handler
     Currently supported: Read and write to stdin/stdout, getrandom
@@ -1450,6 +1562,8 @@ was stored in sym_table during the parse stage:
 3 -> hword
 4 -> word
 5 -> byte
+6 -> double
+7 -> float
 Since the size of each variable is stored we can print out all data
 
 Examples:
@@ -1478,6 +1592,18 @@ get_data('steps')
 returns the list
 [0,0,0,0,0,0,0]
 (assuming nothing has been put there)
+
+Given
+pi: .double 3.14159265359
+get_data('pi')
+returns the list
+[3.14159265359]
+
+Given
+floats: .float 1.5, 2.5, 3.5
+get_data('floats')
+returns the list
+[1.5, 2.5, 3.5]
 '''
 
 
@@ -1514,6 +1640,18 @@ def getdata(variable: str):
             lst = []
             for i in range(0, size, 1):
                 lst.append(int.from_bytes(bytes(mem[index + i:index + i + 1]), 'little'))
+            return lst
+        # double
+        elif (sym_table[variable + '_TYPE_'] == 6):
+            lst = []
+            for i in range(0, size, 8):
+                lst.append(bytes_to_double(mem[index + i:index + i + 8]))
+            return lst
+        # float
+        elif (sym_table[variable + '_TYPE_'] == 7):
+            lst = []
+            for i in range(0, size, 4):
+                lst.append(bytes_to_float(mem[index + i:index + i + 4]))
             return lst
         else:
             print(variable + ': variable not found')
@@ -1656,7 +1794,7 @@ and affected registers after executing each instruction.
 
 
 def repl():
-    global n_flag, z_flag, register_regex
+    global n_flag, z_flag, c_flag, v_flag, register_regex, fp_double_regex, fp_single_regex
     print('armsim repl. operations on memory not supported\ntype q to quit')
     instr = ''
     while (True):
@@ -1666,9 +1804,10 @@ def repl():
         if (not instr): continue
         try:
             execute(instr)
+            # Print integer registers used
             for r in set(re.findall(register_regex, instr)):
                 print("{}: {}".format(r, reg[r]))
-            print("Z: {} N: {}".format(n_flag, z_flag))
+            print("Z: {} N: {} C: {} V: {}".format(z_flag, n_flag, c_flag, v_flag))
         except ValueError as e:
             print(e)
     return
@@ -1680,7 +1819,7 @@ A procedure to return the simulator to it's initial state
 
 
 def reset():
-    global reg, z_flag, n_flag, pc
+    global reg, z_flag, n_flag, c_flag, v_flag, pc
     global require_recursion, forbid_recursion, forbid_loops
     global cycle_count, execute_count
     global ld_cycle, ld_dst
@@ -1694,8 +1833,10 @@ def reset():
     mem.clear()
     asm.clear()
     sym_table.clear()
-    n_flag = False;
+    n_flag = False
     z_flag = False
+    c_flag = False
+    v_flag = False
     pc = 0
     cycle_count = 0
     execute_count = 0

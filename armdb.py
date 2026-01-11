@@ -15,7 +15,7 @@ command, here is a more detailed description of their semantics:
 p:
     The program code is scanned and the used registers are extracted
     Each register in this list is printed on a single line with its value
-    followed by another line with the Z and N flags
+    followed by another line with the Z, N, C, and V flags
 heap:
     Prints out all elements of the heap contained from the beginning of the heap
     to the program break (set with the brk system call). Info stored outside
@@ -38,7 +38,7 @@ mr <regs>:
     Monitored registers are printed out after executing a line or reaching
     a breakpoint. Illegal registers are silently ignored if they are mixed 
     in with legal registers. If only illegal registers are listed the user 
-    gets a message
+    gets a message.
 cmr <regs>:
     This command clears the listed monitored registers. Illegal registers 
     are silently ignored. If no registers are listed, ALL monitored
@@ -62,6 +62,8 @@ ls:
 lhc:
     Lists the L_abel H_it C_ounts for each label in the program, displayed
     in sorted order
+flags:
+    Display the current state of all flags (N, Z, C, V)
 <enter>
     Pressing enter with no other input executes the last executed 
     command. If there is no previous command the user is informed of this
@@ -76,7 +78,10 @@ debugger exits
 '''
 
 help_str = "simple debugger interface for armsim. commands are\n"\
-+"  p            print all registers used in program and flags\n"\
++"  p            print all integer registers used in program and flags\n"\
++"  phex         print all integer registers in hexadecimal\n"\
++"  pbin         print all integer registers in binary\n"\
++"  flags        print all flags (N, Z, C, V)\n"\
 +"  heap         print the heap from the beginning to the break\n"\
 +"  stk <num>    print the n top elements of the stack\n"\
 +"  stk          print the 10 top elements of the stack\n"\
@@ -103,10 +108,10 @@ with the p command or monitored registers.
 
 def print_regs(reg_list, transform=str):
     for r in reg_list:
-        print("{}: {}".format(r, transform(armsim.reg[r])), end=' | ')
+        if r in armsim.reg:
+            print("{}: {}".format(r, transform(armsim.reg[r])), end=' | ')
     if(reg_list):
         print()
-
 
 
 def main(file_name=None, init=None):
@@ -131,9 +136,9 @@ def main(file_name=None, init=None):
     #flag to use so that program can continue from a breakpoint
     came_from_bp = False
     monitors = set()
+    
+    # Find used integer registers
     used_regs = list(set(chain(*[re.findall(rg,instr) for instr in asm])))
-    #sorting isn't perfect, since x10 will come after x1, but it's better
-    #than having a random order
     used_regs.sort()
     
     labels = [l for l in asm if(re.match('{}:'.format(lab),l))]
@@ -141,32 +146,29 @@ def main(file_name=None, init=None):
     
     line = asm[armsim.pc]
     #print first line
-    #if a label in encountered, inc armsim.pc and skip
-    if(re.match(lab+':',line)):
-        print("<label {}>".format(line));armsim.pc+=1
-        armsim.label_hit_counts[line] += 1
-    else:
-        print("\t"+line)    
-       
-    while(True):
-        if(armsim.pc >= len(asm)): print('reached end of program. exiting...');break  
-        #if a label in encountered, inc armsim.pc and skip
-        if(re.match(lab+':',line)):
-            armsim.pc+=1;line = asm[armsim.pc];continue 
-        cmd = input('(armdb) ').lower().strip()
-        if(not cmd and prevcmd):
+    print("\t"+line)
+    while(armsim.pc < len(asm)):
+        cmd = input("$").lower()
+        #check if enter key was pressed, if so execute the prev command
+        if(cmd == ''):
             cmd = prevcmd
-            
-        #command switch statement
         if(cmd == 'p'):
-            print_regs(used_regs, transform=str)
-            print("Z: {} N: {}".format(armsim.z_flag,armsim.n_flag))
+            print_regs(used_regs)
+            print("Z: {} N: {} C: {} V: {}".format(armsim.z_flag, armsim.n_flag, 
+                                                    armsim.c_flag, armsim.v_flag))
+
         elif (cmd == 'phex'):
             print_regs(used_regs, transform=hex)
-            print("Z: {} N: {}".format(armsim.z_flag, armsim.n_flag))
+            print("Z: {} N: {} C: {} V: {}".format(armsim.z_flag, armsim.n_flag,
+                                                    armsim.c_flag, armsim.v_flag))
+
         elif (cmd == 'pbin'):
             print_regs(used_regs, transform=bin)
-            print("Z: {} N: {}".format(armsim.z_flag, armsim.n_flag))
+            print("Z: {} N: {} C: {} V: {}".format(armsim.z_flag, armsim.n_flag,
+                                                    armsim.c_flag, armsim.v_flag))
+        elif (cmd == 'flags'):
+            print("N: {} Z: {} C: {} V: {}".format(armsim.n_flag, armsim.z_flag,
+                                                    armsim.c_flag, armsim.v_flag))
         elif (cmd == 'pmem'):
             print(len(armsim.mem))
         elif(cmd.startswith('stk')):
@@ -191,7 +193,7 @@ def main(file_name=None, init=None):
                     print("<sp+{}>  {}".format(i,hex(value)))
         elif(cmd == 'heap'):
             offset = armsim.brk
-            for addr in range(armsim.data_pointer,armsim.brk,8):
+            for addr in range(armsim.original_break,armsim.brk,8):
                 value = int.from_bytes(bytes(mem[addr:addr+8]),'little')
                 print("<brk-{}>  {}".format(offset,hex(value)))
                 offset -= 8
@@ -208,22 +210,24 @@ def main(file_name=None, init=None):
             reg['xzr'] = 0
             #if program has ended we can print monitors and msg
             if(armsim.pc >= len(asm)):
-                print_regs(monitors)
+                print_regs(list(monitors))
                 print('reached end of program. exiting...');break 
             line = asm[armsim.pc]
             #print next line
             print("\t"+line)
-            print_regs(monitors)
+            print_regs(list(monitors))
         elif(cmd.startswith('mr')):
-            registers = set(re.findall(rg,cmd))
-            if(not registers):print("no registers listed")
-            monitors = monitors.union(registers)
-        elif(cmd.startswith('cmr')):
-            registers = set(re.findall(rg,cmd))
-            if(registers):
-                monitors = monitors.difference()
+            registers = set(re.findall(rg, cmd))
+            if not registers:
+                print("no registers listed")
             else:
-                monitors.clear
+                monitors = monitors.union(registers)
+        elif(cmd.startswith('cmr')):
+            registers = set(re.findall(rg, cmd))
+            if registers:
+                monitors = monitors.difference(registers)
+            else:
+                monitors.clear()
         elif(cmd.startswith('b ')):
             bps = set(re.findall('[0-9]+',cmd))
             for bp in bps: 
@@ -256,7 +260,7 @@ def main(file_name=None, init=None):
                     #keep breaking at the same breakpoint
                     if(armsim.pc in breakpoints and not came_from_bp): 
                         print("break at {}: {}".format(armsim.pc,line))
-                        print_regs(monitors)
+                        print_regs(list(monitors))
                         came_from_bp = True
                         break
                     armsim.execute(line)
@@ -265,7 +269,7 @@ def main(file_name=None, init=None):
                     reg['xzr'] = 0
                 #if program has ended we can print monitors and msg
                 if(armsim.pc >= len(asm)):
-                    print_regs(monitors) 
+                    print_regs(list(monitors))
                     print('reached end of program. exiting...');break
         elif(cmd == 'ls'):
             for i in range(0,len(asm)):
